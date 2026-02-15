@@ -18,6 +18,13 @@ from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.protocol import ChatMessages
 
+DEFAULT_INTERLEAVED_SYSTEM_PROMPT = (
+    "You are an AI reasoning assistant capable of step-by-step interleaved text and visual "
+    "chain of thought. Think step by step and use visual aids to enhance your "
+    "problem-solving. Provide your final conclusion clearly in the format of "
+    '"Final Answer: <answer here>"'
+)
+
 try:
     from lmms_engine.datasets.processor import BagelDataProcessor, ProcessorConfig
     from lmms_engine.models.bagel.inferencer import InterleaveInferencer
@@ -64,6 +71,9 @@ class BagelLmmsEngine(lmms):
         image_ratio: str = "1:1",
         continual_mode: bool = True,
         response_persistent_folder: Optional[str] = None,
+        reasoning_pipeline: str = "default",
+        interleaved_system_prompt: str = DEFAULT_INTERLEAVED_SYSTEM_PROMPT,
+        reasoning_max_iterations: int = 8,
         device: Optional[str] = "cuda",
         device_map: Optional[str] = None,
         **kwargs,
@@ -75,6 +85,12 @@ class BagelLmmsEngine(lmms):
         self.load_in_8bit = load_in_8bit
         self.show_thinking = show_thinking
         self.continual_mode = continual_mode
+        self.reasoning_pipeline = reasoning_pipeline
+        self.interleaved_system_prompt = interleaved_system_prompt
+        self.reasoning_max_iterations = reasoning_max_iterations
+
+        if self.reasoning_pipeline not in {"default", "interleaved"}:
+            raise ValueError("reasoning_pipeline must be either 'default' or 'interleaved'")
 
         # Generation hyperparameters
         self.cfg_text_scale = cfg_text_scale
@@ -213,6 +229,56 @@ class BagelLmmsEngine(lmms):
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
+    def _extract_bagel_text(self, output: str) -> str:
+        if "<|im_start|>" in output and "<|im_end|>" in output:
+            return output.split("<|im_end|>")[0].split("<|im_start|>")[-1].strip()
+        return output.strip()
+
+    def _run_interleaved_reasoning(self, prompt: str, image: Optional[Image.Image], inference_hyper: dict) -> str:
+        current_input: List = [prompt]
+        if image is not None:
+            current_input.append(image)
+
+        reasoning_text: List[str] = []
+        for _ in range(self.reasoning_max_iterations):
+            understanding_hyper = inference_hyper.copy()
+            understanding_hyper["understanding_output"] = True
+            output = self.inferencer.interleave_inference(
+                current_input,
+                system_prompt=self.interleaved_system_prompt,
+                **understanding_hyper,
+            )
+
+            if not output or not isinstance(output[0], str):
+                break
+
+            extracted_text = self._extract_bagel_text(output[0])
+            if extracted_text:
+                reasoning_text.append(extracted_text)
+                current_input = current_input + [extracted_text]
+
+            if "Final Answer:" in output[0] or "<answer>" in output[0]:
+                break
+
+            generation_hyper = inference_hyper.copy()
+            generation_hyper.pop("understanding_output", None)
+            image_output = self.inferencer.interleave_inference(
+                current_input,
+                system_prompt=self.interleaved_system_prompt,
+                **generation_hyper,
+            )
+            generated_images = [item for item in image_output if isinstance(item, Image.Image)]
+            if not generated_images:
+                break
+            current_input = current_input + [generated_images[0]]
+
+        if not reasoning_text:
+            return ""
+        for text in reversed(reasoning_text):
+            if "Final Answer:" in text:
+                return text
+        return reasoning_text[-1]
+
     def generate_text_and_image(self, prompt: str, image: Image.Image, doc_id: str, task: str) -> Tuple[str, List[str]]:
         """
         Generate text and image from prompt
@@ -243,6 +309,9 @@ class BagelLmmsEngine(lmms):
             "image_shapes": self.image_shapes,
             "enable_sde": False,  # Always disable SDE for eval
         }
+
+        if self.reasoning_pipeline == "interleaved":
+            return self._run_interleaved_reasoning(prompt, image, inference_hyper), []
 
         # Generate
         result = self.inferencer(text=prompt, think=self.show_thinking, image=image, **inference_hyper)

@@ -529,19 +529,27 @@ def evaluate(
             task_group_alias[group_name] = configs[task_name]["group_alias"]
 
         limit = get_sample_size(task, limit)
-        task.build_all_requests(
-            limit=limit,
-            offset=offset,
-            rank=global_rank,
-            world_size=world_size,
-            cache_requests=cache_requests,  # later we will add them
-            rewrite_requests_cache=rewrite_requests_cache,
-            system_instruction=system_instruction,
-            apply_chat_template=apply_chat_template,
-            fewshot_as_multiturn=fewshot_as_multiturn,
-            chat_template=getattr(lm, "apply_chat_template") if apply_chat_template else None,
-            tokenizer_name=getattr(lm, "tokenizer_name", "") if apply_chat_template else "",
-        )
+        try:
+            task.build_all_requests(
+                limit=limit,
+                offset=offset,
+                rank=global_rank,
+                world_size=world_size,
+                cache_requests=cache_requests,  # later we will add them
+                rewrite_requests_cache=rewrite_requests_cache,
+                system_instruction=system_instruction,
+                apply_chat_template=apply_chat_template,
+                fewshot_as_multiturn=fewshot_as_multiturn,
+                chat_template=getattr(lm, "apply_chat_template") if apply_chat_template else None,
+                tokenizer_name=getattr(lm, "tokenizer_name", "") if apply_chat_template else "",
+            )
+        except ValueError as exc:
+            if "did not find any docs" in str(exc):
+                eval_logger.warning(
+                    f"Skipping task '{task_name}' because no documents were found for request construction.",
+                )
+                continue
+            raise
         eval_logger.debug(f"Task: {task_output.task_name}; number of requests on this rank: {len(task._instances)}")
         if write_out:
             eval_logger.warning(
