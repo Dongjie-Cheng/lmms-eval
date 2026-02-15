@@ -33,7 +33,7 @@ try:
         from inferencer import InterleaveInferencer
     from bagel.modeling.autoencoder import load_ae
     from bagel.modeling.bagel import (
-        Bagel,
+        Bagel as BagelModel,
         BagelConfig,
         Qwen2Config,
         Qwen2ForCausalLM,
@@ -408,7 +408,7 @@ class BagelUMM(lmms):
         with init_empty_weights():
             language_model = Qwen2ForCausalLM(llm_config)
             vit_model = SiglipVisionModel(vit_config)
-            model = Bagel(language_model, vit_model, config)
+            model = BagelModel(language_model, vit_model, config)
             model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=True)
 
         # Load tokenizer
