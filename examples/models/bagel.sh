@@ -2,31 +2,28 @@
 
 # Bagel Model Evaluation Script
 #
-# This script demonstrates how to run lmms-eval with the Bagel multimodal model
-# for text-to-image generation tasks.
+# This script demonstrates how to run lmms-eval with Bagel's multimodal
+# understanding pipeline, including the new interleaved visual reasoning loop.
 #
 # Prerequisites:
-#   1. Clone Bagel repository at lmms-eval root:
-#      cd /path/to/lmms-eval
-#      git clone https://github.com/ByteDance-Seed/Bagel.git
+#   1. Install Bagel package:
+#      uv pip install git+https://github.com/oscarqjh/Bagel.git
 #
-#   2. Model weights can be anywhere (specify via MODEL_PATH below)
-#      Download from https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT
+#   2. Download a trained checkpoint and pass the model path as $1.
 #
 # Usage:
-#   bash examples/models/bagel.sh
+#   bash examples/models/bagel.sh /path/to/BAGEL-7B-MoT mme
 
-# Set model path - should point to the model weights directory
-# Can be absolute path or relative path
+# Note: local checkpoint folder does not need to include inferencer.py when using the
+# upstream Bagel package; inferencer is imported from the installed python package.
+
 MODEL_PATH=$1
-export GOOGLE_API_KEY=<YOUR_GOOGLE_API_KEY>
-TASK=$2
+TASK=${2:-mme}
 
-# Run evaluation with BFloat16 (default, full precision)
- accelerate launch -m lmms_eval \
-    --model bagel \
-    --model_args pretrained=${MODEL_PATH},mode=1 \
-    --tasks $TASK \
-    --batch_size 1 \
-    --log_samples \
-    --output_path ./logs/
+accelerate launch -m lmms_eval \
+  --model bagel \
+  --model_args pretrained=${MODEL_PATH},mode=understanding,reasoning_pipeline=interleaved,reasoning_max_iterations=8 \
+  --tasks ${TASK} \
+  --batch_size 1 \
+  --log_samples \
+  --output_path ./logs/

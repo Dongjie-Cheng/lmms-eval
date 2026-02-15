@@ -26,7 +26,11 @@ from lmms_eval.api.registry import register_model
 try:
     from bagel.data.data_utils import add_special_tokens, pil_img2rgb
     from bagel.data.transforms import ImageTransform
-    from bagel.inferencer import InterleaveInferencer
+    try:
+        from bagel.inferencer import InterleaveInferencer
+    except ImportError:
+        # Fallback for forks that expose inferencer.py in PYTHONPATH
+        from inferencer import InterleaveInferencer
     from bagel.modeling.autoencoder import load_ae
     from bagel.modeling.bagel import (
         Bagel,
@@ -101,6 +105,13 @@ BASE_PARAMS: Dict[str, Dict[str, Any]] = {
     ),
 }
 
+DEFAULT_INTERLEAVED_SYSTEM_PROMPT = (
+    "You are an AI reasoning assistant capable of step-by-step interleaved text and visual "
+    "chain of thought. Think step by step and use visual aids to enhance your "
+    "problem-solving. Provide your final conclusion clearly in the format of "
+    '"Final Answer: <answer here>"'
+)
+
 
 def generate_run_id() -> str:
     """Generate a unique run ID based on timestamp and UUID."""
@@ -155,12 +166,21 @@ class BagelUMM(lmms):
         # Image generation settings
         image_shapes: Tuple[int, int] = (1024, 1024),
         output_dir: Optional[str] = None,
+        reasoning_pipeline: str = "default",
+        interleaved_system_prompt: str = DEFAULT_INTERLEAVED_SYSTEM_PROMPT,
+        reasoning_max_iterations: int = 8,
         **kwargs,
     ) -> None:
         super().__init__()
 
         if not BAGEL_AVAILABLE:
-            raise ImportError(f"Failed to import Bagel dependencies: {BAGEL_IMPORT_ERROR}\n" "Please install the Bagel package by running:\n" "uv pip install git+https://github.com/oscarqjh/Bagel.git")
+            raise ImportError(
+                f"Failed to import Bagel dependencies: {BAGEL_IMPORT_ERROR}\n"
+                "Please install the Bagel package by running:\n"
+                "uv pip install git+https://github.com/oscarqjh/Bagel.git\n"
+                "If you are using a custom Bagel fork, ensure `InterleaveInferencer` is importable "
+                "from `bagel.inferencer` (or expose `inferencer.py` in PYTHONPATH)."
+            )
 
         # Validate mode
         if mode not in BASE_PARAMS:
@@ -178,6 +198,12 @@ class BagelUMM(lmms):
         self.text_temperature = text_temperature
         self.image_shapes = image_shapes
         self._output_dir_base = output_dir  # Store for later, create after accelerator setup
+        self.reasoning_pipeline = reasoning_pipeline
+        self.interleaved_system_prompt = interleaved_system_prompt
+        self.reasoning_max_iterations = reasoning_max_iterations
+
+        if self.reasoning_pipeline not in {"default", "interleaved"}:
+            raise ValueError("reasoning_pipeline must be either 'default' or 'interleaved'")
 
         # Build inference parameters from mode defaults + overrides
         self.inference_params = BASE_PARAMS[mode].copy()
@@ -265,6 +291,56 @@ class BagelUMM(lmms):
             self._world_size = 1
 
         eval_logger.info(f"Bagel model initialized in '{mode}' mode")
+
+    def _extract_bagel_text(self, output: str) -> str:
+        if "<|im_start|>" in output and "<|im_end|>" in output:
+            return output.split("<|im_end|>")[0].split("<|im_start|>")[-1].strip()
+        return output.strip()
+
+    def _run_interleaved_reasoning(self, input_list: List[Any], inference_params: Dict[str, Any]) -> str:
+        current_input = list(input_list)
+        reasoning_text: List[str] = []
+
+        for _ in range(self.reasoning_max_iterations):
+            understanding_params = inference_params.copy()
+            understanding_params["understanding_output"] = True
+            output = self.inferencer.interleave_inference(
+                current_input,
+                system_prompt=self.interleaved_system_prompt,
+                **understanding_params,
+            )
+
+            if not output or not isinstance(output[0], str):
+                break
+
+            extracted_text = self._extract_bagel_text(output[0])
+            if extracted_text:
+                reasoning_text.append(extracted_text)
+                current_input = current_input + [extracted_text]
+
+            if "Final Answer:" in output[0] or "<answer>" in output[0]:
+                break
+
+            generation_params = inference_params.copy()
+            generation_params.pop("understanding_output", None)
+            gen_output = self.inferencer.interleave_inference(
+                current_input,
+                system_prompt=self.interleaved_system_prompt,
+                **generation_params,
+            )
+
+            generated_images = [item for item in gen_output if isinstance(item, Image.Image)]
+            if not generated_images:
+                break
+            current_input = current_input + [generated_images[0]]
+
+        if not reasoning_text:
+            return ""
+
+        for text in reversed(reasoning_text):
+            if "Final Answer:" in text:
+                return text
+        return reasoning_text[-1]
 
     def _load_model(self):
         """Load Bagel model components."""
@@ -566,6 +642,13 @@ class BagelUMM(lmms):
 
             eval_logger.debug(f"[generate_until] input_list: {input_list}")
             # Run inference
+            if self.reasoning_pipeline == "interleaved" and self.mode in ["understanding", "think_understanding"]:
+                with torch.autocast(device_type="cuda", enabled=True, dtype=self._torch_dtype):
+                    output_text = self._run_interleaved_reasoning(input_list, inference_params)
+                res.append(output_text)
+                pbar.update(1)
+                continue
+
             with torch.autocast(device_type="cuda", enabled=True, dtype=self._torch_dtype):
                 output_list = self.inferencer.interleave_inference(input_list, **inference_params)
 
@@ -600,3 +683,10 @@ class BagelUMM(lmms):
 
     def generate_until_multi_round(self, requests: List[Instance]) -> List[str]:
         raise NotImplementedError("Multi-round generation is not implemented for Bagel")
+
+
+@register_model("bagel")
+class Bagel(BagelUMM):
+    """Alias for backward-compatible `--model bagel` usage."""
+
+    pass
